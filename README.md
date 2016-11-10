@@ -1,9 +1,9 @@
 # seqgen
 
 ## who
-dawnsea
-keeptalk@gmail.com
-http://www.troot.co.kr/ (Korean)
+dawnsea  
+keeptalk@gmail.com  
+http://www.troot.co.kr/ (Korean)  
 
 ## what
 high speed sequence number generator
