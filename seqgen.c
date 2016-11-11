@@ -16,6 +16,14 @@
   * To run: ./echoserver_threaded
   */
 
+/*
+ * 최초 기동후 마스터로 지정한 측과 커넥트가 성공만 하면 무조건 슬레이브 모드로 동작한다.
+ * 슬레이브 모드에서는 무조건 마스터를 호출하여 쓰리쿠션으로 서빙한다.
+ * 슬레이브 모드로 동작하다가 마스터 측에서 응답이 없으면 바로 스스로 마스터로 이행하여 서빙한다.
+ * 이후 죽었던 마스터가 복귀되면 원래 슬레이브였던 현재 마스터에 접속을 시도해보고 접속하면 이전의 마스터는 슬레이브가 된다.
+ * 쉽죠?
+ */
+
 
 #define _GNU_SOURCE
 
@@ -37,6 +45,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <string.h>
+#include <netinet/tcp.h>
+
 
 #include "workqueue.h"
 
@@ -56,13 +66,14 @@
 #define DEF_BACKLOG			1024		// backlog
 #define DEF_WORKER			100		// thread
 #define DEF_KL_INIT			1000
-#define DEF_KL_TOUT			5
+#define DEF_KL_TOUT			1
 
 static int 				pid_fd;
 static volatile int 	global_lock;
 
-static unsigned long    global_count = 0;
-static unsigned long    global_epoch = 0;
+static unsigned long    global_count 	= 0;
+static unsigned long    global_epoch	= 0;
+static int				global_master 	= 0;
 
 struct env_t {
     unsigned int    serve_port;
@@ -77,6 +88,7 @@ struct env_t {
 	char			log_path[PATH_LEN + 1];
 	char 			pid_file[PATH_LEN + 1];
     char            master_addr[HOSTNAME_LEN + 1];
+	int				master_port;
 };
 
 struct env_t env;
@@ -89,12 +101,14 @@ typedef struct client {
 	unsigned long 		last_time;
 	unsigned int		keepalive_count;
 	unsigned int		keepalive;
+	int					master_fd;
 
 } client_t;
 
 static struct event_base 	*evbase_accept;
 static workqueue_t 			workqueue;
 
+static void conn_to_master(client_t *client);
 
 static void disp_params(void)
 {
@@ -107,6 +121,7 @@ static void disp_params(void)
 			" age         = %d\n"
 			" timeout     = %d\n"
             "master addr  = %s\n"
+			"master port  = %d\n"
 //			"log path     = %s\n"
 			"pid file     = %s\n"
             "backlog      = %d\n",
@@ -119,6 +134,7 @@ static void disp_params(void)
 			env.keepalive_init_count,
 			env.keepalive_read_timeout,
 			env.master_addr,
+			env.master_port,
 //			env.log_path,
 			env.pid_file, env.backlog);
 }
@@ -147,6 +163,7 @@ static void parse_params(int argc, char *argv[])
 	env.keepalive		= 1;
 	env.keepalive_init_count 	= DEF_KL_INIT;
 	env.keepalive_read_timeout 	= DEF_KL_TOUT;
+	env.master_port		= 5555;
 
 	strcpy(env.log_path, DEF_LOG_FILE);
 	strcpy(env.pid_file, DEF_PID_FILE);
@@ -157,6 +174,7 @@ static void parse_params(int argc, char *argv[])
          "e:"   // 에포크 시작 값
          "m:"	// 마스터 주소
 		 "d:"	//
+		 "o:"
 		 "n"	// keepalive
 		 "hsc"
      ))) {
@@ -186,6 +204,9 @@ static void parse_params(int argc, char *argv[])
         case 'm':
             strncpy(env.master_addr, optarg, HOSTNAME_LEN);
             break;
+		case 'o':
+            env.master_port = atoi(optarg);
+	        break;
 		case 'n':
             env.keepalive = 0;
             break;
@@ -355,94 +376,155 @@ static void closeAndFreeClient(client_t *client)
 	}
 }
 
+#define BUF_MAX	4096
 void buffered_on_read(struct bufferevent *bev, void *arg) {
 	client_t *client = (client_t *)arg;
-	char data[4096];
+	int wlen, len;
+	char data[BUF_MAX + 1], hb = 'H';
 	int nbytes;
+	int res;
+	fd_set fds;
+	struct timeval tv;
+	socklen_t lon;
+	int valopt;
 
 	while ((nbytes = EVBUFFER_LENGTH(bev->input)) > 0) {
-		if (nbytes > 4096) nbytes = 4096;
+		if (nbytes > BUF_MAX) nbytes = BUF_MAX;
 		evbuffer_remove(bev->input, data, nbytes);
 
 		if (nbytes > 30 && strcasestr(data, "Connection: Keep-Alive") != NULL) {
 			client->keepalive = 1;
 		}
+#if 0
 //		evbuffer_drain(bev->input, nbytes);
+		simple_spinlock();
+		if (global_master == 0) {
+			simple_spinunlock();
+
+			res = write(client->master_fd, &hb, 1);
+			if (res < 0) {
+				if (errno == EINPROGRESS) {
+					tv.tv_sec 	= 1;
+					tv.tv_usec 	= 0;
+
+					FD_ZERO(&fds);
+					FD_SET(client->master_fd, &fds);
+
+					if (select(client->master_fd + 1, NULL, &fds, NULL, &tv) > 0) {
+						lon = sizeof(int);
+						getsockopt(client->master_fd, SOL_SOCKET, SO_ERROR, (void*)(&valopt), &lon);
+						if (valopt) {
+							close(client->master_fd);
+							simple_spinlock();
+							global_master = 1;
+							simple_spinunlock();
+						}
+					} else {
+						close(client->master_fd);
+						simple_spinlock();
+						global_master = 1;
+						simple_spinunlock();
+					}
+				}
+			}
+
+
+		} else {
+			simple_spinunlock();
+		}
+
+		res = read(client->master_fd, data, BUF_MAX);
+		if (res < 0) {
+			if (errno == EINPROGRESS) {
+				tv.tv_sec 	= 1;
+				tv.tv_usec 	= 0;
+
+				FD_ZERO(&fds);
+				FD_SET(client->master_fd, &fds);
+
+				if (select(client->master_fd + 1, &fds, NULL, NULL, &tv) > 0) {
+					lon = sizeof(int);
+					getsockopt(client->master_fd, SOL_SOCKET, SO_ERROR, (void*)(&valopt), &lon);
+					if (valopt) {
+						close(client->master_fd);
+						simple_spinlock();
+						global_master = 1;
+						simple_spinunlock();
+					}
+				} else {
+					close(client->master_fd);
+					simple_spinlock();
+					global_master = 1;
+					simple_spinunlock();
+				}
+			}
 
 
 
+
+		}
+#endif
 		simple_spinlock();
 		switch (env.running_mode) {
 			case MODE_HTTP:
 				if (env.keepalive && client->keepalive_count > 0 && client->keepalive) {
-					snprintf(data, 4096, "HTTP/1.1 200 OK\r\nKeep-Alive: timeout=%d, max=%d\r\nConnection: Keep-Alive\r\nContent-Length: 33\r\n\r\n%016lx:%016lx",
+					snprintf(data, BUF_MAX, "HTTP/1.1 200 OK\r\nKeep-Alive: timeout=%d, max=%d\r\nConnection: Keep-Alive\r\nContent-Length: 33\r\n\r\n%016lx:%016lx",
 						env.keepalive_read_timeout, client->keepalive_count, global_epoch, global_count);
 				} else {
-					snprintf(data, 4096, "HTTP/1.1 200 OK\r\nContent-Length: 33\r\nConnection: close\r\n\r\n%016lx:%016lx",
-						global_epoch, global_count++);
+					snprintf(data, BUF_MAX, "HTTP/1.1 200 OK\r\nContent-Length: 33\r\nConnection: close\r\n\r\n%016lx:%016lx",
+						global_epoch, global_count);
 				}
 
 				break;
 			case MODE_SOCK:
-				snprintf(data, 4096, "%016lx:%016lx", global_epoch, global_count);
+				snprintf(data, BUF_MAX, "%016lx:%016lx", global_epoch, global_count);
 				break;
 			case MODE_MC:
-				snprintf(data, 4096, "%ld\r\n", global_count);
+				snprintf(data, BUF_MAX, "%ld\r\n", global_count);
 				break;
 
 		}
 		simple_spinunlock();
-//		evbuffer_add(client->output_buffer, data, strnlen(data, 4096));
+		evbuffer_add(client->output_buffer, data, strnlen(data, BUF_MAX));
 	}
 
-	int wlen, len;
-	len = strlen(data);
-
-	wlen = write(client->fd, data, len);
-	if (wlen < len) {
-          warn("sock write error");
-    } else {
-		if (global_count == 0xffffffffffffffffLL) {
-			global_count = 0;
-			global_epoch++;
-		} else {
-			global_count++;
-			if (env.running_mode == MODE_HTTP) {
-				if (env.keepalive && client->keepalive) {
-					if (client->keepalive_count == 0) {
-						bufferevent_set_timeouts(client->buf_ev, NULL, NULL);
-						closeClient(client);
-						if (client->buf_ev != NULL) {
-							bufferevent_free(client->buf_ev);
-							client->buf_ev = NULL;
-						}
-						client->keepalive_count = env.keepalive_init_count;
-					} else {
-						client->keepalive_count--;
-					}
-				} else {
-					bufferevent_set_timeouts(client->buf_ev, NULL, NULL);
-					closeClient(client);
-					if (client->buf_ev != NULL) {
-						bufferevent_free(client->buf_ev);
-						client->buf_ev = NULL;
-					}
-				}
-			}
-		}
+	if (bufferevent_write_buffer(bev, client->output_buffer)) {
+		syslog(LOG_INFO, "Error sending data to client on fd %d\n", client->fd);
+		closeClient(client);
 	}
-//	if (bufferevent_write_buffer(bev, client->output_buffer)) {
-//		syslog(LOG_INFO, "Error sending data to client on fd %d\n", client->fd);
-//		closeClient(client);
-//	}
 }
 
 void buffered_on_write(struct bufferevent *bev, void *arg)
 {
 	client_t *client = (client_t *)arg;
 
-	if (client->fd == -1)
-		closeAndFreeClient(client);
+	simple_spinlock();
+	if (global_count == 0xffffffffffffffffLL) {
+		global_count = 0;
+		global_epoch++;
+	} else {
+		global_count++;
+	}
+	simple_spinunlock();
+
+	if (env.running_mode == MODE_HTTP) {
+		if (env.keepalive && client->keepalive) {
+			if (client->keepalive_count == 0) {
+				bufferevent_set_timeouts(client->buf_ev, NULL, NULL);
+				event_base_loopexit(client->evbase, NULL);
+//				closeAndFreeClient(client);
+//				closeClient(client);
+//				client->keepalive_count = env.keepalive_init_count;
+			} else {
+				client->keepalive_count--;
+			}
+		} else {
+			bufferevent_set_timeouts(client->buf_ev, NULL, NULL);
+			event_base_loopexit(client->evbase, NULL);
+//			closeAndFreeClient(client);
+//			closeClient(client);
+		}
+	}
 }
 
 
@@ -486,6 +568,7 @@ void on_accept(int fd, short ev, void *arg) {
 	}
 	memset(client, 0, sizeof(*client));
 	client->fd = client_fd;
+//	conn_to_master(client);
 
 	if (env.running_mode == MODE_HTTP && env.keepalive) {
 		tv.tv_sec 	= env.keepalive_read_timeout;
@@ -593,16 +676,119 @@ int runServer(void)
 	return 0;
 }
 
+int tcpSetKeepAlive(int nSockFd_, int nKeepAlive_, int nKeepAliveIdle_, int nKeepAliveCnt_, int nKeepAliveInterval_)
+{
+     int nRtn;
+     nRtn = setsockopt(nSockFd_, SOL_SOCKET, SO_KEEPALIVE, &nKeepAlive_, sizeof(nKeepAlive_));
+     if(nRtn == -1)
+    {
+         err(1, "[TCP server]Fail: setsockopt():so_keepalive");
+         return -1;
+     }
+     nRtn = setsockopt(nSockFd_, SOL_TCP, TCP_KEEPIDLE, &nKeepAliveIdle_, sizeof(nKeepAliveIdle_) );
+     if(nRtn == -1)
+     {
+          err(1, "[TCP server]Fail: setsockopt():so_keepidle");
+          return -1;
+     }
+     nRtn = setsockopt(nSockFd_, SOL_TCP, TCP_KEEPCNT, &nKeepAliveCnt_, sizeof(nKeepAliveCnt_) );
+     if(nRtn == -1)
+     {
+          err(1, "[TCP server]Fail: setsockopt():so_keepcnt");
+          return -1;
+      }
+     nRtn = setsockopt(nSockFd_, SOL_TCP, TCP_KEEPINTVL, &nKeepAliveInterval_, sizeof(nKeepAliveInterval_) );
+     if(nRtn == -1)
+     {
+          err(1, "[TCP server]Fail: setsockopt():so_keepintvl");
+          return -1;
+      }
+     return nRtn;
+}
+
+static void conn_to_master(client_t *client)
+{
+ 	struct sockaddr_in 	serveraddr;
+	struct timeval 		tv;
+	fd_set 				conn_set;
+	socklen_t 			lon;
+	int					valopt;
+	int					res;
+	int					master = 0;
+
+	client->master_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (client->master_fd == -1) {
+		printf("master mode start 0\n");
+		master = 1;
+	}
+
+	if (setnonblock(client->master_fd) < 0) {
+		err(1, "nonblock error");
+	}
+
+	tcpSetKeepAlive(client->master_fd, 1, 1, 3, 10);
+
+	serveraddr.sin_family 			= AF_INET;
+	serveraddr.sin_addr.s_addr 		= inet_addr(env.master_addr);
+	serveraddr.sin_port 			= htons(env.master_port);
+
+	if (serveraddr.sin_addr.s_addr < 0) {
+		printf("master mode start 1\n");
+		master = 1;
+	}
+
+	if (master == 0) {
+		res = connect(client->master_fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr));
+		if (res < 0) {
+			if (errno == EINPROGRESS) {
+				tv.tv_sec 	= 1;
+				tv.tv_usec 	= 0;
+				FD_ZERO(&conn_set);
+				FD_SET(client->master_fd, &conn_set);
+				if (select(client->master_fd + 1, NULL, &conn_set, NULL, &tv) > 0) {
+					lon = sizeof(int);
+					getsockopt(client->master_fd, SOL_SOCKET, SO_ERROR, (void*)(&valopt), &lon);
+					if (valopt) {
+						close(client->master_fd);
+						master = 1;
+						printf("master mode start 2 %s\n", valopt == ECONNREFUSED ? "ECONNREFUSED" : valopt == ETIMEDOUT ? "ETIMEDOUT" : "unknown");
+					}
+				} else {
+
+					close(client->master_fd);
+					master = 1;
+					printf("master mode start 3\n");
+				}
+			}
+		}
+	}
+
+	simple_spinlock();
+	global_master = master;
+	simple_spinunlock();
+}
+
+void init_master_check(void)
+{
+	client_t client;
+	conn_to_master(&client);
+	close(client.master_fd);
+}
+
 int main(int argc, char *argv[])
 {
 	parse_params(argc, argv);
 	disp_params();
+
+	if (env.master_addr[0] != 0) {
+		init_master_check();
+	}
 
 	setlogmask(LOG_UPTO(LOG_INFO));
 	openlog(DAEMON_NAME, LOG_CONS | LOG_PERROR, LOG_USER);
 
 	syslog(LOG_INFO, "seqgen starting up");
 
-	go_daemon();
+//	go_daemon();
 	return runServer();
 }
