@@ -39,10 +39,10 @@ syslog, domain : seqgen
 
 ## test
 
-http : open browser and go http://localhost:5555/
-*note1* : The seq number will be increase double because of request of 'favicon.ico'.
-socket : go telnet localhost 5555, and press enter.
-memcached compatible : use memcached client library, and request 'incr' memcached command. or telnet localhost 5555, and press enter
+http : open browser and go http://localhost:5555/  
+*note1* : The seq number will be increase double because of request of 'favicon.ico'.  
+socket : go telnet localhost 5555, and press enter.  
+memcached compatible : use memcached client library, and request 'incr' memcached command. or telnet localhost 5555, and press enter  
 
 ## performance test
 http : use apache ab or jmeter. ex) ab -c 100 -n 10000 http://localhost:5555/
