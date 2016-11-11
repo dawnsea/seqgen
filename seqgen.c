@@ -1,8 +1,21 @@
 /*
- * seqgen
+ * seqgen, high speeed sequence number generator
  * build : make
- * dawnsea, keeptalk@gmail.com
+ * who : dawnsea, keeptalk@gmail.com
+ * There is Original comment box below this comment.
+ * The other original comments was removed for reading codes.
  */
+
+ /**
+  * Multithreaded, libevent-based socket server.
+  * Copyright (c) 2012 Ronald Bennett Cemer
+  * This software is licensed under the BSD license.
+  * See the accompanying LICENSE.txt for details.
+  *
+  * To compile: gcc -o echoserver_threaded echoserver_threaded.c workqueue.c -levent -lpthread
+  * To run: ./echoserver_threaded
+  */
+
 
 #define _GNU_SOURCE
 
@@ -40,7 +53,7 @@
 #define DEF_PID_FILE		"/var/lock/seqgen.pid"
 #define DEF_LOG_FILE		"/tmp/debug.log"
 #define DEF_SRV_PORT		5555
-#define DEF_BACKLOG			100		// backlog
+#define DEF_BACKLOG			1024		// backlog
 #define DEF_WORKER			100		// thread
 #define DEF_KL_INIT			1000
 #define DEF_KL_TOUT			5
@@ -428,11 +441,10 @@ void buffered_on_write(struct bufferevent *bev, void *arg)
 {
 	client_t *client = (client_t *)arg;
 
-	if (env.running_mode == MODE_HTTP && client->keepalive_count == 0)
-		closeClient(client);
-	if (env.running_mode == MODE_HTTP && env.keepalive == 0)
-		closeClient(client);
+	if (client->fd == -1)
+		closeAndFreeClient(client);
 }
+
 
 void buffered_on_error(struct bufferevent *bev, short what, void *arg) {
 	closeClient((client_t *)arg);
@@ -493,7 +505,7 @@ void on_accept(int fd, short ev, void *arg) {
 		return;
 	}
 
-	if ((client->buf_ev = bufferevent_new(client_fd, buffered_on_read, NULL, buffered_on_error, client)) == NULL) {
+	if ((client->buf_ev = bufferevent_new(client_fd, buffered_on_read, buffered_on_write, buffered_on_error, client)) == NULL) {
 		syslog(LOG_WARNING, "client bufferevent creation failed");
 		closeAndFreeClient(client);
 		return;
